@@ -1,3 +1,6 @@
+import { setTimeout as sleep } from 'timers/promises';
+import { AbortError } from 'node-fetch';
+
 // https://stackoverflow.com/questions/57835286/deep-recursive-requiredt-on-specific-properties
 export type DeepRequired<T> = {
   [P in keyof T]-?: DeepRequired<T[P]>
@@ -22,16 +25,22 @@ export function pickDefined<T>(value1?: T, value2?: T) {
   return value1 !== undefined ? value1 : value2;
 }
 
-export function sleepBeforeExecute<T>(fn: () => Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    setTimeout(async () => {
-      try {
-        const result = await fn();
-        resolve(result);
-      }
-      catch (error) {
-        reject(error);
-      }
-    }, ms);
-  });
+export function normalizeAbortError(error: unknown, signal?: AbortSignal): unknown {
+  if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
+    return error instanceof AbortError ? error : new AbortError('Operation aborted');
+  }
+  return error;
+}
+
+export async function sleepBeforeExecute<T>(fn: () => Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
+  try {
+    await sleep(ms, undefined, { signal });
+    if (signal?.aborted) {
+      throw new AbortError('Operation aborted');
+    }
+    return await fn();
+  }
+  catch (error) {
+    throw normalizeAbortError(error, signal);
+  }
 }

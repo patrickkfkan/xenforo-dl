@@ -11,6 +11,10 @@ const COMMAND_LINE_ARGS = {
   help: 'help',
   url: 'url',
   cookie: 'cookie',
+  browser: 'browser',
+  browserChannel: 'browser-channel',
+  browserLogin: 'browser-login',
+  browserTimeout: 'browser-timeout',
   outDir: 'out-dir',
   dirStructure: 'dir-structure',
   overwrite: 'overwrite',
@@ -21,7 +25,8 @@ const COMMAND_LINE_ARGS = {
   minTimePage: 'min-time-page',
   minTimeAttachment: 'min-time-image',
   noPrompt: 'no-prompt',
-  continue: 'continue'
+  continue: 'continue',
+  filterPrefix: 'filter-prefix'
 } as const;
 
 const OPT_DEFS = [
@@ -39,9 +44,31 @@ const OPT_DEFS = [
   },
   {
     name: COMMAND_LINE_ARGS.cookie,
-    description: 'Cookie to set in requests',
+    description: 'Raw Cookie header or path to a file containing it',
     alias: 'k',
     type: String
+  },
+  {
+    name: COMMAND_LINE_ARGS.browser,
+    description: 'Use a local headed Chromium session for pages and attachments (Node >=20 required)',
+    type: Boolean
+  },
+  {
+    name: COMMAND_LINE_ARGS.browserChannel,
+    description: 'Browser channel to launch (e.g. "chrome", "msedge", "chromium"). Requires --browser',
+    type: String,
+    typeLabel: '<channel>'
+  },
+  {
+    name: COMMAND_LINE_ARGS.browserLogin,
+    description: 'Require authenticated XenForo content; allows manual login in the browser. Requires --browser',
+    type: Boolean
+  },
+  {
+    name: COMMAND_LINE_ARGS.browserTimeout,
+    description: 'Browser operation/login timeout in milliseconds. Default: 120000. Requires --browser',
+    type: String,
+    typeLabel: '<milliseconds>'
   },
   {
     name: COMMAND_LINE_ARGS.outDir,
@@ -115,6 +142,14 @@ const OPT_DEFS = [
     description: 'Do not prompt for confirmation to proceed',
     alias: 'y',
     type: Boolean
+  },
+  {
+    name: COMMAND_LINE_ARGS.filterPrefix,
+    description: 'Filter threads by given prefixes (e.g. "Đề Thi PE")',
+    alias: 'f',
+    type: String,
+    multiple: true,
+    typeLabel: '<prefixes>'
   }
 ];
 
@@ -142,7 +177,9 @@ export default class CommandLineParser {
       const booleanTypeArgs = [
         COMMAND_LINE_ARGS.noPrompt,
         COMMAND_LINE_ARGS.overwrite,
-        COMMAND_LINE_ARGS.continue
+        COMMAND_LINE_ARGS.continue,
+        COMMAND_LINE_ARGS.browser,
+        COMMAND_LINE_ARGS.browserLogin
       ];
       if (booleanTypeArgs.includes(key as any) && value !== undefined) {
         value = '1';
@@ -155,6 +192,12 @@ export default class CommandLineParser {
         return {
           key: __getOptNameUsed(key),
           value: String(value).trim()
+        };
+      }
+      if (Array.isArray(value)) {
+        return {
+          key: __getOptNameUsed(key),
+          value: value as string[]
         };
       }
       return undefined;
@@ -172,10 +215,15 @@ export default class CommandLineParser {
           page: __getValue(COMMAND_LINE_ARGS.minTimePage),
           attachment: __getValue(COMMAND_LINE_ARGS.minTimeAttachment)
         },
-        cookie: __getValue(COMMAND_LINE_ARGS.cookie)
+        cookie: __getValue(COMMAND_LINE_ARGS.cookie),
+        browser: __getValue(COMMAND_LINE_ARGS.browser),
+        browserChannel: __getValue(COMMAND_LINE_ARGS.browserChannel),
+        browserLogin: __getValue(COMMAND_LINE_ARGS.browserLogin),
+        browserTimeout: __getValue(COMMAND_LINE_ARGS.browserTimeout)
       },
       continue: __getValue(COMMAND_LINE_ARGS.continue),
       noPrompt: __getValue(COMMAND_LINE_ARGS.noPrompt),
+      filterPrefix: __getValue(COMMAND_LINE_ARGS.filterPrefix) as any,
       logging: {
         level: __getValue(COMMAND_LINE_ARGS.logLevel),
         file: __getValue(COMMAND_LINE_ARGS.logFile)
@@ -274,7 +322,7 @@ export default class CommandLineParser {
   static #parseArgs() {
     const opts = commandLineArgs(OPT_DEFS, { stopAtFirstUnknown: true });
     if (opts['_unknown']) {
-      const unknownOpt = Object.keys(opts['_unknown'])[0];
+      const unknownOpt = opts['_unknown'][0];
       throw Error(`Unknown option '${unknownOpt}'`);
     }
     return opts;

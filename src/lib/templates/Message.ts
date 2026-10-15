@@ -34,7 +34,19 @@ export default class MessageTemplate {
 
   static format(message: ThreadMessage) {
     const attachments = message.attachments
-      .map((attachment, i) => `${i}: ${attachment.filename}`)
+      .map((attachment, i) => {
+        let str = `${i}: ${attachment.filename}`;
+        if (attachment.comments && attachment.comments.length > 0) {
+          const validComments = attachment.comments.filter(c => c.text);
+          if (validComments.length > 0) {
+            const commentsStr = validComments
+              .map(c => `   [${c.user || 'Unknown'}]: ${c.text}`)
+              .join(EOL);
+            str += `${EOL}   Comments:${EOL}${commentsStr}`;
+          }
+        }
+        return str;
+      })
       .join(EOL);
     const template = attachments ? MESSAGE_TEMPLATE_WITH_ATTACHMENTS : MESSAGE_TEMPLATE_WITHOUT_ATTACHMENTS;
     return template

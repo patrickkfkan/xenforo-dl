@@ -84,7 +84,7 @@ export default class XenForoDownloaderCLI {
     }
 
     const downloaderName = downloader.name;
-    const displayConfig = this.#getConfigForDisplay(downloader.getConfig());
+    const displayConfig = this.#getConfigForDisplay(downloader.getConfig() as any);
 
     if (!options.noPrompt) {
       if (options.logging.level === 'none') {
@@ -109,19 +109,24 @@ export default class XenForoDownloaderCLI {
       commonLog(logger, 'debug', null, `Created ${downloaderName} instance with config: `, displayConfig);
     }
 
+    const abortController = new AbortController();
+    const abort = () => abortController.abort();
+    process.on('SIGINT', abort);
+    let exitCode = 0;
     try {
-      const abortController = new AbortController();
-      process.on('SIGINT', () => {
-        abortController.abort();
-      });
-      await downloader.start({ signal: abortController.signal });
-      // Return this.exit(hasDownloaderError ? 1 : 0);
-
+      const stats = await downloader.start({ signal: abortController.signal });
+      exitCode = stats.errorCount > 0 ? 1 : 0;
     }
     catch (error) {
-      commonLog(logger, 'error', null, `Uncaught ${downloaderName} error:`, error);
-      return this.exit(1);
+      exitCode = abortController.signal.aborted ? 130 : 1;
+      if (exitCode !== 130) {
+        commonLog(logger, 'error', null, `${downloaderName} failed:`, error);
+      }
     }
+    finally {
+      process.removeListener('SIGINT', abort);
+    }
+    return this.exit(exitCode);
   }
 
   #getConfigForDisplay(config: DownloaderConfig) {

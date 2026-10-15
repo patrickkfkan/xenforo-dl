@@ -29,12 +29,16 @@ export default class URLHelper {
     if (!url) {
       return null;
     }
-    const regex = /\/forums\/(.+)\.(\d+)/g;
+    const regex = /\/forums\/([^\/]+)(?:\/|$)/g;
     const matches = regex.exec(url);
-    if (matches && matches[2]) {
+    if (matches && matches[1]) {
+      const parts = matches[1].split('.');
+      const maybeId = parts[parts.length - 1];
+      const id = maybeId && /^\d+$/.test(maybeId) ? Number(maybeId) : 0;
+      const slug = id > 0 ? parts.slice(0, -1).join('.') : matches[1];
       return {
-        slug: matches[1],
-        id: Number(matches[2])
+        slug,
+        id
       };
     }
     return null;

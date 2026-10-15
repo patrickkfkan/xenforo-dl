@@ -4,6 +4,9 @@ export default class CLIOptionValidator {
 
   static validateRequired(entry?: CLIOptionParserEntry, errMsg?: string) {
     if (entry && entry.value) {
+      if (Array.isArray(entry.value)) {
+        return entry.value[0];
+      }
       return entry.value;
     }
     if (errMsg) {
@@ -19,18 +22,38 @@ export default class CLIOptionValidator {
     if (!entry) {
       return undefined;
     }
-    const value = entry.value || undefined;
+    const value = entry.value;
+    if (typeof value !== 'string' && value !== undefined) {
+      throw Error(`${entry.key} must be a single string`);
+    }
     if (match.length > 0 && value && !match.includes(value)) {
       throw Error(`${entry.key} must be one of ${match.map((m) => `'${m}'`).join(', ')}`);
     }
     return value;
   }
 
+  static validateStringArray(entry?: CLIOptionParserEntry): string[] | undefined {
+    if (!entry || entry.value === undefined) {
+      return undefined;
+    }
+    const value = entry.value;
+    if (Array.isArray(value)) {
+      return value;
+    }
+    if (typeof value === 'string') {
+      return [value];
+    }
+    throw Error(`${entry.key} must be a string or array of strings`);
+  }
+
   static validateBoolean(entry?: CLIOptionParserEntry) {
     if (!entry) {
       return undefined;
     }
-    const value = entry.value || undefined;
+    const value = entry.value;
+    if (Array.isArray(value)) {
+      throw Error(`${entry.key} cannot be an array`);
+    }
     const trueValues = [ 'yes', '1', ' true' ];
     const falseValues = [ 'no', '0', 'false' ];
     let sanitized: boolean | undefined;
@@ -56,7 +79,10 @@ export default class CLIOptionValidator {
     if (!entry) {
       return undefined;
     }
-    const value = entry.value || undefined;
+    const value = entry.value;
+    if (Array.isArray(value)) {
+      throw Error(`${entry.key} cannot be an array`);
+    }
     const sanitized = value ? parseInt(value, 10) : undefined;
     if (sanitized !== undefined) {
       if (isNaN(sanitized)) {
@@ -76,7 +102,10 @@ export default class CLIOptionValidator {
     if (!entry) {
       return undefined;
     }
-    const value = entry.value || undefined;
+    const value = entry.value;
+    if (Array.isArray(value)) {
+      throw Error(`${entry.key} cannot be an array`);
+    }
     if (match.length > 0 && value) {
       let unmatch = value;
       for (const m of match) {

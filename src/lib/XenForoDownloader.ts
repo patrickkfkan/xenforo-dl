@@ -23,7 +23,9 @@ export interface DownloaderConfig extends DeepRequired<Pick<DownloaderOptions,
   'dirStructure' |
   'request' |
   'overwrite' |
-  'continue'>> {
+  'continue' |
+  'filterPrefix' |
+  'noPrompt'>> {
     targetURL: string;
   }
 
@@ -55,7 +57,7 @@ export default class XenForoDownloader {
 
   name = 'XenForoDownloader';
 
-  #fetcher: Fetcher;
+  #fetcher?: Promise<Fetcher | import('./utils/BrowserFetcher.js').default>;
   protected pageFetchLimiter: Bottleneck;
   protected attachmentDownloadLimiter: Bottleneck;
   protected config: deepFreeze.DeepReadonly<DownloaderConfig>;
@@ -78,7 +80,7 @@ export default class XenForoDownloader {
     this.parser = new Parser(this.logger);
   }
 
-  async start(params: DownloaderStartParams): Promise<void> {
+  async start(params: DownloaderStartParams = {}): Promise<DownloadStats> {
     const stats: DownloadStats = {
       processedForumCount: 0,
       processedThreadCount: 0,
@@ -87,43 +89,60 @@ export default class XenForoDownloader {
       downloadedAttachmentCount: 0,
       errorCount: 0
     };
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    params.signal?.addEventListener('abort', abort, { once: true });
+    if (params.signal?.aborted) {
+      abort();
+    }
+    let failure: unknown;
     try {
-      await this.#process(this.config.targetURL, stats, params.signal);
-      this.log('info', 'Download complete');
+      if (controller.signal.aborted) {
+        throw new AbortError('Download aborted');
+      }
+      await this.#process(this.config.targetURL, stats, controller.signal);
+      this.log('info', stats.errorCount === 0 ? 'Download complete' : 'Download incomplete');
     }
     catch (error) {
-      const __clearLimiters = () => {
-        return Promise.all([
-          this.pageFetchLimiter.stop({
-            dropErrorMessage: 'LimiterStopOnError',
-            dropWaitingJobs: true
-          }),
-          this.attachmentDownloadLimiter.stop({
-            dropErrorMessage: 'LimiterStopOnError',
-            dropWaitingJobs: true
-          })
-        ]);
-      };
-      if (error instanceof AbortError) {
-        this.log('info', 'Aborting...');
-        await __clearLimiters();
+      failure = error;
+      if (error instanceof AbortError || params.signal?.aborted) {
         this.log('info', 'Download aborted');
       }
       else {
-        this.log('error', 'Unhandled error: ', error);
+        this.log('error', 'Download failed:', error);
         this.#updateStatsOnError(error, stats);
-        await __clearLimiters();
       }
     }
-    this.log('info', '--------------');
-    this.log('info', 'Download stats');
-    this.log('info', '--------------');
-    this.log('info', `Processed forums: ${stats.processedForumCount}`);
-    this.log('info', `Processed threads: ${stats.processedThreadCount}`);
-    this.log('info', `Processed messages: ${stats.processedMessageCount}`);
-    this.log('info', `Downloaded attachments: ${stats.downloadedAttachmentCount}`);
-    this.log('info', `Skipped existing attachments: ${stats.skippedExistingAttachmentCount}`);
-    this.log('info', `Errors: ${stats.errorCount}`);
+    finally {
+      // Cancel executing transport jobs before Bottleneck waits for them to stop.
+      abort();
+      const close = this.#fetcher?.then((fetcher) => fetcher.close(), () => undefined);
+      const stopped = Promise.all([
+        this.pageFetchLimiter.stop({ dropErrorMessage: 'LimiterStopOnError', dropWaitingJobs: true }),
+        this.attachmentDownloadLimiter.stop({ dropErrorMessage: 'LimiterStopOnError', dropWaitingJobs: true })
+      ]);
+      try {
+        await Promise.all([ close, stopped ]);
+      }
+      catch (error) {
+        failure ??= error;
+        this.#updateStatsOnError(error, stats);
+      }
+      params.signal?.removeEventListener('abort', abort);
+      this.log('info', '--------------');
+      this.log('info', 'Download stats');
+      this.log('info', '--------------');
+      this.log('info', `Processed forums: ${stats.processedForumCount}`);
+      this.log('info', `Processed threads: ${stats.processedThreadCount}`);
+      this.log('info', `Processed messages: ${stats.processedMessageCount}`);
+      this.log('info', `Downloaded attachments: ${stats.downloadedAttachmentCount}`);
+      this.log('info', `Skipped existing attachments: ${stats.skippedExistingAttachmentCount}`);
+      this.log('info', `Errors: ${stats.errorCount}`);
+    }
+    if (failure) {
+      throw failure;
+    }
+    return stats;
   }
 
   #updateStatsOnError(error: any, stats: DownloadStats) {
@@ -166,35 +185,28 @@ export default class XenForoDownloader {
     let threadPage: ThreadPage | null = null;
     this.log('info', `Fetching thread content from "${url}"`);
     try {
-      const {html} = await this.#fetchPage(url, signal);
-      threadPage = this.parser.parseThreadPage(html, url);
+      const { html, lastURL } = await this.#fetchPage(url, signal);
+      threadPage = this.parser.parseThreadPage(html, lastURL);
+      threadPage.url = lastURL;
       if (threadPage) {
         this.log('info', `Fetched "${threadPage.title}" (page ${threadPage.currentPage} / ${threadPage.totalPages})`);
 
         if (!context?.continued && this.config.continue) {
-          try {
-            const prevDownload = this.#checkPreviousDownload(threadPage, this.#getThreadSavePath(threadPage));
-            if (!prevDownload) {
-              this.log('debug', `Previous download not found for "${threadPage.title}"`);
-            }
-            else {
-              this.log('info', 'Continuing from previous download');
-              this.log('debug', 'Previous download status:', prevDownload);
-              return this.#downloadThread(prevDownload.url, stats, signal, { continued: true, continueFromMessageID: prevDownload.messageID });
-            }
+          const prevDownload = this.#checkPreviousDownload(threadPage, this.#getThreadSavePath(threadPage));
+          if (prevDownload) {
+            this.log('info', 'Continuing from previous download');
+            return await this.#downloadThread(prevDownload.url, stats, signal, { continued: true, continueFromMessageID: prevDownload.messageID });
           }
-          catch (error) {
-            this.log('error', 'Error occurred while checking previous download:', error);
-            this.log('warn', 'Ignoring \'continue\' flag');
-          }
+          this.log('debug', `Previous download not found for "${threadPage.title}"`);
         }
 
         if (context?.continueFromMessageID) {
           const i = threadPage.messages.findIndex((msg) => msg.id === context.continueFromMessageID);
-          if (i >= 0) {
-            const removed = threadPage.messages.splice(0, i + 1);
-            this.log('debug', `Removed ${removed.length} previously downloaded messages from thread`);
+          if (i < 0) {
+            throw new FetcherError('Saved checkpoint message is missing from this thread page', url, true);
           }
+          const removed = threadPage.messages.splice(0, i + 1);
+          this.log('debug', `Removed ${removed.length} previously downloaded messages from thread`);
           if (threadPage.messages.length === 0) {
             this.log('info', 'No new messages since previous download');
           }
@@ -211,12 +223,13 @@ export default class XenForoDownloader {
           this.log('debug', `${attachmentsWithoutFilenames.length} attachments do not have filenames - obtaining them by HEAD requests`);
           const __setAttachmentFilename = async(attachment: ThreadMessageAttachment) => {
             try {
-              const filename = await (await this.getFetcher()).fetchFilenameByHeaders({
+              const fetcher = await this.getFetcher(signal);
+              const filename = await this.attachmentDownloadLimiter.schedule(() => fetcher.fetchFilenameByHeaders({
                 url: attachment.url,
                 maxRetries: this.config.request.maxRetries,
-                retryInterval: this.config.request.minTime.page,
+                retryInterval: this.config.request.minTime.attachment,
                 signal
-              });
+              }));
               attachment.filename = filename || undefined;
               this.log('debug', `Set filename of attachment #${attachment.id} to "${attachment.filename}"`);
             }
@@ -224,7 +237,7 @@ export default class XenForoDownloader {
               if (this.#isErrorNonContinuable(error)) {
                 throw error;
               }
-              this.log('warn', 'Failed to obtain filename from headers:', error);
+              this.log('warn', 'Failed to obtain filename from headers; using attachment ID:', error);
             }
           };
           await Promise.all(attachmentsWithoutFilenames.map((attachment) => __setAttachmentFilename(attachment)));
@@ -257,11 +270,41 @@ export default class XenForoDownloader {
             if (hasAttachments) {
               fse.ensureDirSync(attachmentSavePath);
               await Promise.all(message.attachments.map((attachment) => this.#downloadMessageAttachment(attachment, attachmentSavePath, stats, signal)));
-            }
-            this.#saveMessage(message, messageFile);
-            stats.processedMessageCount++;
 
-            this.#saveDownloadStatus(threadPage, message, threadSavePath);
+              await Promise.all(message.attachments.map(async (attachment) => {
+                if (attachment.mediaUrl) {
+                  try {
+                    const fetcher = await this.getFetcher(signal);
+                    const mediaUrl = attachment.mediaUrl;
+                    const { html } = await this.pageFetchLimiter.schedule(() => fetcher.fetchHTML({
+                      url: mediaUrl,
+                      maxRetries: this.config.request.maxRetries,
+                      retryInterval: this.config.request.minTime.page,
+                      signal
+                    }));
+                    attachment.comments = this.parser.parseMediaComments(html);
+                    if (attachment.comments.length > 0) {
+                      this.log('debug', `Parsed ${attachment.comments.length} comments for attachment ${attachment.filename || attachment.id}`);
+                    }
+                  }
+                  catch (error) {
+                    this.log('error', `Failed to fetch attachment comments from ${attachment.mediaUrl}:`, error);
+                    throw error;
+                  }
+                }
+              }));
+            }
+            const previousSize = fse.statSync(messageFile).size;
+            try {
+              this.#saveMessage(message, messageFile);
+              this.#saveDownloadStatus(threadPage, message, threadSavePath);
+            }
+            catch (error) {
+              // Ponytail: rollback covers write failures, not process crashes; add durable offsets for crash-safe resume.
+              fse.truncateSync(messageFile, previousSize);
+              throw error;
+            }
+            stats.processedMessageCount++;
           }
         }
       }
@@ -272,6 +315,7 @@ export default class XenForoDownloader {
       }
       this.log('error', error);
       this.#updateStatsOnError(error, stats);
+      return;
     }
     if (threadPage?.nextURL) {
       this.log('info', 'Proceeding to next batch of messages');
@@ -288,8 +332,8 @@ export default class XenForoDownloader {
     let forumPage: ForumPage | null = null;
     this.log('info', `Fetching forum content from "${url}"`);
     try {
-      const {html} = await this.#fetchPage(url, signal);
-      forumPage = this.parser.parseForumPage(html, url);
+      const { html, lastURL } = await this.#fetchPage(url, signal);
+      forumPage = this.parser.parseForumPage(html, lastURL);
       if (forumPage) {
         this.log('info', `Fetched "${forumPage.title}" (page ${forumPage.currentPage} / ${forumPage.totalPages})`);
         this.log('debug', 'Parsed forum page:', {
@@ -301,8 +345,28 @@ export default class XenForoDownloader {
         });
         // Download threads
         if (forumPage.threads.length > 0) {
-          this.log('info', `This page has ${forumPage.threads.length} threads`);
-          for (const thread of forumPage.threads) {
+          let threadsToDownload = forumPage.threads;
+          const prefixes = this.config.filterPrefix;
+          if (prefixes.length > 0) {
+            threadsToDownload = threadsToDownload.filter((t) => t.prefix && prefixes.includes(t.prefix));
+          }
+          else if (!this.config.noPrompt) {
+            const uniquePrefixes = Array.from(new Set(forumPage.threads.map((t) => t.prefix).filter((p) => !!p)));
+            if (uniquePrefixes.length > 0) {
+              const { default: Enquirer } = await import('enquirer');
+              const promptFunc = (Enquirer as any).prompt || new (Enquirer as any)().prompt.bind(new (Enquirer as any)());
+              const { selected } = await promptFunc({
+                type: 'multiselect',
+                name: 'selected',
+                message: `Select prefixes to download from page ${forumPage.currentPage} / ${forumPage.totalPages} (Space to select, Enter to confirm):`,
+                choices: uniquePrefixes as string[]
+              });
+              threadsToDownload = threadsToDownload.filter((t) => t.prefix && selected.includes(t.prefix));
+            }
+          }
+
+          this.log('info', `This page has ${forumPage.threads.length} threads. Filtering selected ${threadsToDownload.length} threads to download.`);
+          for (const thread of threadsToDownload) {
             await this.#process(thread.url, stats, signal);
           }
         }
@@ -335,8 +399,8 @@ export default class XenForoDownloader {
   async #downloadGeneric(url: string, stats: DownloadStats, signal?: AbortSignal) {
     this.log('info', `Fetching "${url}"`);
     try {
-      const {html} = await this.#fetchPage(url, signal);
-      const page = this.parser.parseGenericPage(html, url);
+      const { html, lastURL } = await this.#fetchPage(url, signal);
+      const page = this.parser.parseGenericPage(html, lastURL);
       if (page) {
         if (page.forums.length > 0) {
           this.log('info', `Found ${page.forums.length} forums on page`);
@@ -355,15 +419,25 @@ export default class XenForoDownloader {
     }
   }
 
-  protected async getFetcher() {
+  protected async getFetcher(signal?: AbortSignal) {
     if (!this.#fetcher) {
-      this.#fetcher = await Fetcher.getInstance(this.logger, this.config.request.cookie);
+      this.#fetcher = this.config.request.browser ? (async () => {
+        const { default: BrowserFetcher } = await import('./utils/BrowserFetcher.js');
+        return BrowserFetcher.getInstance({
+          url: this.config.targetURL,
+          cookie: this.config.request.cookie,
+          timeout: this.config.request.browserTimeout,
+          requireLogin: this.config.request.browserLogin,
+          channel: this.config.request.browserChannel || undefined,
+          signal
+        }, this.logger);
+      })() : Fetcher.getInstance(this.logger, this.config.request.cookie, new URL(this.config.targetURL).origin);
     }
     return this.#fetcher;
   }
 
   async #fetchPage(url: string, signal?: AbortSignal) {
-    const fetcher = await this.getFetcher();
+    const fetcher = await this.getFetcher(signal);
     return this.pageFetchLimiter.schedule(() => {
       this.log('debug', `Fetch page "${url}"`);
       return fetcher.fetchHTML({
@@ -430,7 +504,7 @@ export default class XenForoDownloader {
     }
 
     try {
-      const fetcher = await this.getFetcher();
+      const fetcher = await this.getFetcher(signal);
       await this.attachmentDownloadLimiter.schedule(() => fetcher.downloadAttachment({
         src: attachment.url,
         dest: destPath,
@@ -446,7 +520,7 @@ export default class XenForoDownloader {
         throw error;
       }
       this.log('error', `Error downloading "${filename}" from "${attachment.url}": `, error);
-      this.#updateStatsOnError(error, stats);
+      throw error;
     }
   }
 
@@ -497,8 +571,12 @@ export default class XenForoDownloader {
     const file = this.#getDownloadStatusFilePath(thread, threadSavePath);
     if (fse.existsSync(file)) {
       const json = fse.readJSONSync(file);
-      if (!json.threadID || !json.url || !json.messageID) {
-        throw Error(`Failed to read previous download status from "${file}": invalid format`);
+      if (json.threadID !== thread.id || typeof json.url !== 'string' || !Number.isSafeInteger(json.messageID) || json.messageID <= 0) {
+        throw new FetcherError('Saved checkpoint has an invalid thread, URL or message ID', thread.url, true);
+      }
+      const savedURL = new URL(json.url);
+      if (savedURL.origin !== new URL(this.config.targetURL).origin || URLHelper.parseThreadURL(json.url)?.id !== thread.id) {
+        throw new FetcherError('Saved checkpoint URL does not match this thread and site', thread.url, true);
       }
       return json;
     }
@@ -512,12 +590,16 @@ export default class XenForoDownloader {
       messageID: lastSavedMessage.id
     };
     const file = this.#getDownloadStatusFilePath(thread, threadSavePath);
+    const temporary = `${file}.part`;
     try {
-      fse.writeJSONSync(file, status);
+      fse.writeJSONSync(temporary, status);
+      fse.renameSync(temporary, file);
       this.log('debug', `Saved download status to "${file}"`);
     }
-    catch (error) {
-      this.log('error', `Failed to save download status to "${file}"`, error);
+    finally {
+      if (fse.existsSync(temporary)) {
+        fse.removeSync(temporary);
+      }
     }
   }
 }
